@@ -16,7 +16,9 @@
         ]
       }
     ],
-    "signaling_timeout_sec": 30
+    "signaling_timeout_sec": 30,
+    "download_dir": "downloads",
+    "file_chunk_bytes": 65536
   },
   "peers": {
     "peer2": {
