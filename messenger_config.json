@@ -1,5 +1,5 @@
 {
-  "sender_id": "peer1",
+  "sender_id": "replace-with-local-sender-id",
   "listen": {
     "host": "127.0.0.1",
     "port": 7000
@@ -8,10 +8,21 @@
     "host": "127.0.0.1",
     "port": 9050
   },
+  "webrtc": {
+    "ice_servers": [
+      {
+        "urls": [
+          "stun:stun.l.google.com:19302"
+        ]
+      }
+    ],
+    "signaling_timeout_sec": 30
+  },
   "peers": {
     "peer2": {
       "onion": "replace-with-peer2-onion-address.onion",
-      "port": 7000
+      "port": 7000,
+      "sender_id": "replace-with-peer2-sender-id"
     }
   }
 }
