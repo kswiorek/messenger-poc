@@ -1,0 +1,1 @@
+start tor\tor\tor.exe -f tor\torrc
