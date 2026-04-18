@@ -8,6 +8,12 @@
     "host": "127.0.0.1",
     "port": 9050
   },
+  "tor_process": {
+    "autostart": true,
+    "executable": "tor/tor/tor.exe",
+    "config": "tor/torrc",
+    "startup_timeout_ms": 8000
+  },
   "webrtc": {
     "ice_servers": [
       {

@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QTimer, pyqtSignal
+from PyQt6.QtCore import QProcess, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -44,6 +44,14 @@ class MessengerGui(QMainWindow):
         self.backend: MessengerApp | None = None
         self.cfg: dict[str, Any] = self._load_config()
         self.peer_map = self._peers_from_cfg(self.cfg)
+        self.project_root = Path(__file__).parent.resolve()
+
+        tor_cfg = self.cfg.get("tor_process", {}) if isinstance(self.cfg, dict) else {}
+        self.tor_autostart = bool(tor_cfg.get("autostart", True))
+        self.tor_executable_path = self._resolve_project_path(str(tor_cfg.get("executable", "tor/tor/tor.exe")))
+        self.tor_config_path = self._resolve_project_path(str(tor_cfg.get("config", "tor/torrc")))
+        self.tor_startup_timeout_ms = int(tor_cfg.get("startup_timeout_ms", 8000))
+        self.tor_process: QProcess | None = None
 
         self.current_peer = ""
         self.chat_history: dict[str, list[tuple[str, str]]] = {name: [] for name in self.peer_map.keys()}
@@ -72,6 +80,9 @@ class MessengerGui(QMainWindow):
         self._wire_events()
         self._populate_peer_list()
 
+        if self.tor_autostart:
+            self.start_tor_process()
+
     def _load_config(self) -> dict[str, Any]:
         try:
             cfg = load_config(BASE_CONFIG_PATH, LOCAL_CONFIG_PATH)
@@ -80,6 +91,12 @@ class MessengerGui(QMainWindow):
         except Exception:
             pass
         return {"peers": {}}
+
+    def _resolve_project_path(self, raw_path: str) -> Path:
+        path = Path(raw_path)
+        if path.is_absolute():
+            return path
+        return (self.project_root / path).resolve()
 
     def _peers_from_cfg(self, cfg: dict[str, Any]) -> dict[str, dict]:
         peers = cfg.get("peers", {})
@@ -391,6 +408,72 @@ class MessengerGui(QMainWindow):
         self.debug_output.insertPlainText(text + "\n")
         self.debug_output.moveCursor(self.debug_output.textCursor().MoveOperation.End)
 
+    def start_tor_process(self) -> None:
+        if self.tor_process is not None and self.tor_process.state() != QProcess.ProcessState.NotRunning:
+            return
+
+        if not self.tor_executable_path.exists():
+            self._append_debug(
+                "[tor] executable not found. Run PowerShell: .\\setup_tor.ps1"
+            )
+            return
+
+        if not self.tor_config_path.exists():
+            self._append_debug(f"[tor] torrc not found: {self.tor_config_path}")
+            return
+
+        self.tor_process = QProcess(self)
+        self.tor_process.setProgram(str(self.tor_executable_path))
+        self.tor_process.setArguments(["-f", str(self.tor_config_path)])
+        self.tor_process.setWorkingDirectory(str(self.project_root))
+        self.tor_process.readyReadStandardOutput.connect(self._read_tor_stdout)
+        self.tor_process.readyReadStandardError.connect(self._read_tor_stderr)
+        self.tor_process.finished.connect(self._on_tor_process_finished)
+        self.tor_process.start()
+
+        if not self.tor_process.waitForStarted(self.tor_startup_timeout_ms):
+            error_text = self.tor_process.errorString()
+            self._append_debug(f"[tor] failed to start: {error_text}")
+            self.tor_process = None
+            return
+
+        self._append_debug(f"[tor] started: {self.tor_executable_path}")
+
+    def stop_tor_process(self) -> None:
+        if self.tor_process is None:
+            return
+
+        if self.tor_process.state() != QProcess.ProcessState.NotRunning:
+            self.tor_process.terminate()
+            if not self.tor_process.waitForFinished(3000):
+                self.tor_process.kill()
+                self.tor_process.waitForFinished(3000)
+
+        self.tor_process = None
+        self._append_debug("[tor] stopped")
+
+    def _read_tor_stdout(self) -> None:
+        if self.tor_process is None:
+            return
+
+        chunk = bytes(self.tor_process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        for line in chunk.replace("\r", "\n").splitlines():
+            if line.strip():
+                self._append_debug(f"[tor] {line}")
+
+    def _read_tor_stderr(self) -> None:
+        if self.tor_process is None:
+            return
+
+        chunk = bytes(self.tor_process.readAllStandardError()).decode("utf-8", errors="replace")
+        for line in chunk.replace("\r", "\n").splitlines():
+            if line.strip():
+                self._append_debug(f"[tor-err] {line}")
+
+    def _on_tor_process_finished(self, _exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
+        self._append_debug("[tor] process exited")
+        self.tor_process = None
+
     def is_running(self) -> bool:
         return self.backend is not None
 
@@ -419,6 +502,9 @@ class MessengerGui(QMainWindow):
     def start_backend(self) -> None:
         if self.is_running():
             return
+
+        if self.tor_autostart:
+            self.start_tor_process()
 
         self.cfg = self._load_config()
         self.peer_map = self._peers_from_cfg(self.cfg)
@@ -660,6 +746,7 @@ class MessengerGui(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.stop_backend()
+        self.stop_tor_process()
         super().closeEvent(event)
 
 

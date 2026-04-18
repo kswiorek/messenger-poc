@@ -40,4 +40,10 @@ def load_config(base_config_path: Path, local_config_path: Path) -> dict:
     cfg["webrtc"].setdefault("download_dir", "downloads")
     cfg["webrtc"].setdefault("file_chunk_bytes", 65536)
 
+    cfg.setdefault("tor_process", {})
+    cfg["tor_process"].setdefault("autostart", True)
+    cfg["tor_process"].setdefault("executable", "tor/tor/tor.exe")
+    cfg["tor_process"].setdefault("config", "tor/torrc")
+    cfg["tor_process"].setdefault("startup_timeout_ms", 8000)
+
     return cfg
