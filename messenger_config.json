@@ -1,0 +1,17 @@
+{
+  "sender_id": "peer1",
+  "listen": {
+    "host": "127.0.0.1",
+    "port": 7000
+  },
+  "tor_socks": {
+    "host": "127.0.0.1",
+    "port": 9050
+  },
+  "peers": {
+    "peer2": {
+      "onion": "replace-with-peer2-onion-address.onion",
+      "port": 7000
+    }
+  }
+}
