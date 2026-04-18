@@ -53,6 +53,8 @@ class MessengerGui(QMainWindow):
         self.ping_queue: list[str] = []
         self.active_ping_peer = ""
         self.active_ping_started_ms = 0
+        self.active_ping_request_id = 0
+        self.next_ping_request_id = 1
 
         self.probe_interval_timer = QTimer(self)
         self.probe_interval_timer.setInterval(30000)
@@ -297,6 +299,7 @@ class MessengerGui(QMainWindow):
             self.ping_worker_timer.stop()
             self.ping_queue.clear()
             self.active_ping_peer = ""
+            self.active_ping_request_id = 0
             return
 
         now_ms = int(time.time() * 1000)
@@ -305,6 +308,7 @@ class MessengerGui(QMainWindow):
                 timed_out_peer = self.active_ping_peer
                 self.active_ping_peer = ""
                 self.active_ping_started_ms = 0
+                self.active_ping_request_id = 0
                 self._set_peer_status(timed_out_peer, "offline")
                 self._append_debug(f"[presence] ping timeout for {timed_out_peer}")
             return
@@ -314,9 +318,17 @@ class MessengerGui(QMainWindow):
             return
 
         peer_name = self.ping_queue.pop(0)
+        request_id = self.next_ping_request_id
+        self.next_ping_request_id += 1
         self.active_ping_peer = peer_name
+        self.active_ping_request_id = request_id
         self.active_ping_started_ms = now_ms
-        self._run_backend_task("ping", self._must_backend().ping_peer, peer_name, context={"peer": peer_name, "purpose": "presence"})
+        self._run_backend_task(
+            "ping",
+            self._must_backend().ping_peer,
+            peer_name,
+            context={"peer": peer_name, "purpose": "presence", "request_id": request_id},
+        )
 
     def _filter_peers(self, text: str) -> None:
         text_lower = text.strip().lower()
@@ -446,6 +458,7 @@ class MessengerGui(QMainWindow):
         self.ping_queue.clear()
         self.active_ping_peer = ""
         self.active_ping_started_ms = 0
+        self.active_ping_request_id = 0
 
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
@@ -464,9 +477,6 @@ class MessengerGui(QMainWindow):
             peer_name = str(payload.get("peer_name", ""))
             ok = bool(payload.get("ok", False))
             if peer_name:
-                if self.active_ping_peer == peer_name:
-                    self.active_ping_peer = ""
-                    self.active_ping_started_ms = 0
                 if ok:
                     rtt = float(payload.get("rtt_ms", 0.0))
                     self._set_peer_status(peer_name, "online", rtt_ms=f"{rtt:.1f} ms")
@@ -500,9 +510,26 @@ class MessengerGui(QMainWindow):
         context = context_obj if isinstance(context_obj, dict) else {}
         peer_name = str(context.get("peer", "")) if context else ""
         purpose = str(context.get("purpose", "")) if context else ""
+        request_id = int(context.get("request_id", 0)) if context else 0
 
-        if task_name == "ping" and not ok and purpose == "manual":
-            QMessageBox.warning(self, "Ping Failed", error)
+        if task_name == "ping":
+            # Presence pipeline completion is authoritative for timeout bookkeeping.
+            if purpose == "presence" and request_id and request_id == self.active_ping_request_id:
+                self.active_ping_peer = ""
+                self.active_ping_started_ms = 0
+                self.active_ping_request_id = 0
+
+            if ok and peer_name:
+                try:
+                    rtt = float(result) if result is not None else 0.0
+                except (TypeError, ValueError):
+                    rtt = 0.0
+                self._set_peer_status(peer_name, "online", rtt_ms=f"{rtt:.1f} ms")
+            elif peer_name:
+                self._set_peer_status(peer_name, "offline")
+
+            if not ok and purpose == "manual":
+                QMessageBox.warning(self, "Ping Failed", error)
             return
 
         if task_name == "rtc_status":
