@@ -3,10 +3,10 @@
 #   tor\\tor.exe -f tor\\torrc
 
 SocksPort 9050
-DataDirectory D:\\KRZYS\\prog\\python\\messenger-poc\\tor\\data\\peer1
+DataDirectory .\\tor\\data\\peer1
 
 # Onion service that forwards onion:7000 to local messenger listener 127.0.0.1:7000
-HiddenServiceDir D:\\KRZYS\\prog\\python\\messenger-poc\\tor\\data\\peer1_hidden_service
+HiddenServiceDir .\\tor\\data\\peer1_hidden_service
 HiddenServiceVersion 3
 HiddenServicePort 7000 127.0.0.1:7000
 
