@@ -2,3 +2,4 @@ tor/*
 messenger_config.local.json
 __pycache__/
 *.pyc
+Bee.png
