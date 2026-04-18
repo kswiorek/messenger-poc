@@ -1,10 +1,11 @@
 import html
-import re
 import sys
+import threading
 import time
 from pathlib import Path
+from typing import Any
 
-from PyQt6.QtCore import QProcess, QTimer
+from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -22,28 +23,28 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from messenger.app import MessengerApp
 from messenger.config import load_config
 
 
 BASE_CONFIG_PATH = Path("messenger_config.json")
 LOCAL_CONFIG_PATH = Path("messenger_config.local.json")
 
-MSG_IN_PATTERN = re.compile(r"\[msg\]\s+([^:]+):\s*(.*)")
-PING_OK_PATTERN = re.compile(r"\[ok\]\s+ping\s+(\S+)\s+rtt_ms=([0-9.]+)")
-
 
 class MessengerGui(QMainWindow):
+    backend_event_signal = pyqtSignal(str, dict)
+    backend_log_signal = pyqtSignal(str)
+    task_done_signal = pyqtSignal(str, bool, object, object, str)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Messenger")
         self.resize(1120, 760)
 
-        self.process: QProcess | None = None
-        self.python_path = Path(sys.executable)
-        self.script_path = Path(__file__).parent / "messenger.py"
-        self.stdout_buffer = ""
+        self.backend: MessengerApp | None = None
+        self.cfg: dict[str, Any] = self._load_config()
+        self.peer_map = self._peers_from_cfg(self.cfg)
 
-        self.peer_map = self._load_peers_from_config()
         self.current_peer = ""
         self.chat_history: dict[str, list[tuple[str, str]]] = {name: [] for name in self.peer_map.keys()}
         self.peer_status: dict[str, str] = {name: "unknown" for name in self.peer_map.keys()}
@@ -61,19 +62,26 @@ class MessengerGui(QMainWindow):
         self.ping_worker_timer.setInterval(200)
         self.ping_worker_timer.timeout.connect(self._process_ping_queue)
 
+        self.backend_event_signal.connect(self._on_backend_event)
+        self.backend_log_signal.connect(self._append_debug)
+        self.task_done_signal.connect(self._on_task_done)
+
         self._build_ui()
         self._wire_events()
         self._populate_peer_list()
 
-    def _load_peers_from_config(self) -> dict[str, dict]:
+    def _load_config(self) -> dict[str, Any]:
         try:
             cfg = load_config(BASE_CONFIG_PATH, LOCAL_CONFIG_PATH)
-            peers = cfg.get("peers", {})
-            if isinstance(peers, dict):
-                return peers
+            if isinstance(cfg, dict):
+                return cfg
         except Exception:
             pass
-        return {}
+        return {"peers": {}}
+
+    def _peers_from_cfg(self, cfg: dict[str, Any]) -> dict[str, dict]:
+        peers = cfg.get("peers", {})
+        return peers if isinstance(peers, dict) else {}
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -165,16 +173,6 @@ class MessengerGui(QMainWindow):
         debug_label.setStyleSheet("font-weight: 600;")
         self.debug_output = QTextEdit()
         self.debug_output.setReadOnly(True)
-        self.raw_input = QLineEdit()
-        self.raw_input.setPlaceholderText("Advanced raw command, e.g. /rtc status peer2")
-        self.send_raw_button = QPushButton("Send Raw")
-
-        raw_row = QWidget()
-        raw_row_layout = QHBoxLayout(raw_row)
-        raw_row_layout.setContentsMargins(0, 0, 0, 0)
-        raw_row_layout.setSpacing(6)
-        raw_row_layout.addWidget(self.raw_input, stretch=1)
-        raw_row_layout.addWidget(self.send_raw_button)
 
         right_layout.addWidget(header)
         right_layout.addWidget(self.chat_view, stretch=1)
@@ -182,7 +180,6 @@ class MessengerGui(QMainWindow):
         right_layout.addWidget(rtc_test)
         right_layout.addWidget(debug_label)
         right_layout.addWidget(self.debug_output, stretch=1)
-        right_layout.addWidget(raw_row)
 
         main_layout.addWidget(left, stretch=3)
         main_layout.addWidget(right, stretch=8)
@@ -222,14 +219,11 @@ class MessengerGui(QMainWindow):
         self.send_file_button.clicked.connect(self.send_file)
         self.message_input.returnPressed.connect(self.send_message)
 
-        self.ping_button.clicked.connect(lambda: self.send_peer_command("/ping"))
-        self.rtc_connect_button.clicked.connect(lambda: self.send_peer_command("/rtc connect"))
-        self.rtc_accept_button.clicked.connect(lambda: self.send_peer_command("/rtc accept"))
+        self.ping_button.clicked.connect(lambda: self._request_ping("manual"))
+        self.rtc_connect_button.clicked.connect(self.send_rtc_connect)
+        self.rtc_accept_button.clicked.connect(self.send_rtc_accept)
         self.rtc_status_button.clicked.connect(self.send_rtc_status)
         self.rtc_test_button.clicked.connect(self.send_rtc_test)
-
-        self.send_raw_button.clicked.connect(self.send_raw)
-        self.raw_input.returnPressed.connect(self.send_raw)
 
         self.peer_list.currentItemChanged.connect(self._on_peer_selected)
         self.search_input.textChanged.connect(self._filter_peers)
@@ -268,7 +262,8 @@ class MessengerGui(QMainWindow):
             self.peer_list.setCurrentRow(row_to_select)
 
     def _refresh_peers(self) -> None:
-        self.peer_map = self._load_peers_from_config()
+        self.cfg = self._load_config()
+        self.peer_map = self._peers_from_cfg(self.cfg)
         for name in self.peer_map.keys():
             self.chat_history.setdefault(name, [])
             self.peer_status.setdefault(name, "unknown")
@@ -309,6 +304,7 @@ class MessengerGui(QMainWindow):
             if now_ms - self.active_ping_started_ms > 12000:
                 timed_out_peer = self.active_ping_peer
                 self.active_ping_peer = ""
+                self.active_ping_started_ms = 0
                 self._set_peer_status(timed_out_peer, "offline")
                 self._append_debug(f"[presence] ping timeout for {timed_out_peer}")
             return
@@ -320,7 +316,7 @@ class MessengerGui(QMainWindow):
         peer_name = self.ping_queue.pop(0)
         self.active_ping_peer = peer_name
         self.active_ping_started_ms = now_ms
-        self.send_command(f"/ping {peer_name}")
+        self._run_backend_task("ping", self._must_backend().ping_peer, peer_name, context={"peer": peer_name, "purpose": "presence"})
 
     def _filter_peers(self, text: str) -> None:
         text_lower = text.strip().lower()
@@ -384,24 +380,49 @@ class MessengerGui(QMainWindow):
         self.debug_output.moveCursor(self.debug_output.textCursor().MoveOperation.End)
 
     def is_running(self) -> bool:
-        return self.process is not None and self.process.state() != QProcess.ProcessState.NotRunning
+        return self.backend is not None
+
+    def _must_backend(self) -> MessengerApp:
+        if self.backend is None:
+            raise RuntimeError("Backend is not running")
+        return self.backend
+
+    def _run_backend_task(
+        self,
+        task_name: str,
+        func,
+        *args,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        def target() -> None:
+            try:
+                result = func(*args)
+                self.task_done_signal.emit(task_name, True, context or {}, result, "")
+            except Exception as exc:
+                self.task_done_signal.emit(task_name, False, context or {}, None, str(exc))
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
 
     def start_backend(self) -> None:
         if self.is_running():
             return
 
-        if not self.script_path.exists():
-            QMessageBox.critical(self, "Error", f"Backend script not found: {self.script_path}")
-            return
+        self.cfg = self._load_config()
+        self.peer_map = self._peers_from_cfg(self.cfg)
+        self._populate_peer_list()
 
-        self.process = QProcess(self)
-        self.process.setProgram(str(self.python_path))
-        self.process.setArguments([str(self.script_path)])
-        self.process.setWorkingDirectory(str(self.script_path.parent))
-        self.process.readyReadStandardOutput.connect(self._read_stdout)
-        self.process.readyReadStandardError.connect(self._read_stderr)
-        self.process.finished.connect(self._on_process_finished)
-        self.process.start()
+        try:
+            self.backend = MessengerApp(
+                self.cfg,
+                on_event=lambda event_type, payload: self.backend_event_signal.emit(event_type, payload),
+                on_log=lambda message: self.backend_log_signal.emit(message),
+            )
+            self.backend.start()
+        except Exception as exc:
+            self.backend = None
+            QMessageBox.critical(self, "Error", f"Failed to start backend: {exc}")
+            return
 
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
@@ -411,90 +432,95 @@ class MessengerGui(QMainWindow):
         self.probe_interval_timer.start()
 
     def stop_backend(self) -> None:
-        if not self.is_running():
+        if self.backend is None:
             return
 
-        self.send_command("/quit")
-        assert self.process is not None
-        if not self.process.waitForFinished(2000):
-            self.process.terminate()
-            if not self.process.waitForFinished(2000):
-                self.process.kill()
+        try:
+            self.backend.stop()
+        except Exception as exc:
+            self._append_debug(f"[error] backend stop failed: {exc}")
 
+        self.backend = None
         self.probe_interval_timer.stop()
         self.ping_worker_timer.stop()
         self.ping_queue.clear()
         self.active_ping_peer = ""
+        self.active_ping_started_ms = 0
 
-    def _on_process_finished(self) -> None:
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
-
-        self.probe_interval_timer.stop()
-        self.ping_worker_timer.stop()
-        self.ping_queue.clear()
-        self.active_ping_peer = ""
-
         self._append_debug("[gui] backend stopped")
 
-    def _handle_backend_line(self, line: str) -> None:
-        stripped = line.strip()
-        if not stripped:
-            return
-
-        ping_match = PING_OK_PATTERN.match(stripped)
-        if ping_match:
-            peer_name = ping_match.group(1).strip()
-            rtt = ping_match.group(2).strip()
-            self._set_peer_status(peer_name, "online", rtt_ms=f"{rtt} ms")
-            if self.active_ping_peer == peer_name:
-                self.active_ping_peer = ""
-            self._append_debug(stripped)
-            return
-
-        if stripped.startswith("[error]") and self.active_ping_peer:
-            failed_peer = self.active_ping_peer
-            self.active_ping_peer = ""
-            self._set_peer_status(failed_peer, "offline")
-            self._append_debug(stripped)
-            return
-
-        msg_match = MSG_IN_PATTERN.match(stripped)
-        if msg_match:
-            sender_id = msg_match.group(1).strip()
-            text = msg_match.group(2).strip()
+    def _on_backend_event(self, event_type: str, payload: dict) -> None:
+        if event_type == "text_received":
+            sender_id = str(payload.get("sender_id", ""))
+            text = str(payload.get("text", ""))
             peer_name = self._map_sender_to_peer(sender_id)
             self._append_chat(peer_name, "in", text)
             self._set_peer_status(peer_name, "online")
             return
 
-        if stripped.startswith("[file]") or stripped.startswith("[rtc]") or stripped.startswith("[rtc-test]"):
-            if self.current_peer:
-                self._append_chat(self.current_peer, "sys", stripped)
-            self._append_debug(stripped)
+        if event_type == "ping_result":
+            peer_name = str(payload.get("peer_name", ""))
+            ok = bool(payload.get("ok", False))
+            if peer_name:
+                if self.active_ping_peer == peer_name:
+                    self.active_ping_peer = ""
+                    self.active_ping_started_ms = 0
+                if ok:
+                    rtt = float(payload.get("rtt_ms", 0.0))
+                    self._set_peer_status(peer_name, "online", rtt_ms=f"{rtt:.1f} ms")
+                else:
+                    self._set_peer_status(peer_name, "offline")
             return
 
-        self._append_debug(stripped)
-
-    def _read_stdout(self) -> None:
-        if self.process is None:
+        if event_type == "rtc_offer_received":
+            peer_name = str(payload.get("peer_name", ""))
+            if peer_name:
+                self._append_chat(peer_name, "sys", "Incoming RTC offer. Click RTC Accept to continue.")
             return
 
-        chunk = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
-        self.stdout_buffer += chunk.replace("\r", "")
+        if event_type in {
+            "rtc_data_open",
+            "rtc_data_closed",
+            "rtc_answer_applied",
+            "rtc_offer_sent",
+            "rtc_answer_sent",
+            "rtc_test_received",
+            "file_sent",
+            "file_received",
+            "file_error",
+            "file_ack",
+        }:
+            peer_name = str(payload.get("peer_name", ""))
+            if peer_name:
+                self._append_chat(peer_name, "sys", f"{event_type}: {payload}")
 
-        while "\n" in self.stdout_buffer:
-            line, rest = self.stdout_buffer.split("\n", 1)
-            self.stdout_buffer = rest
-            self._handle_backend_line(line)
+    def _on_task_done(self, task_name: str, ok: bool, context_obj: object, result: object, error: str) -> None:
+        context = context_obj if isinstance(context_obj, dict) else {}
+        peer_name = str(context.get("peer", "")) if context else ""
+        purpose = str(context.get("purpose", "")) if context else ""
 
-    def _read_stderr(self) -> None:
-        if self.process is None:
+        if task_name == "ping" and not ok and purpose == "manual":
+            QMessageBox.warning(self, "Ping Failed", error)
             return
 
-        chunk = bytes(self.process.readAllStandardError()).decode("utf-8", errors="replace")
-        for line in chunk.splitlines():
-            self._append_debug(f"[stderr] {line}")
+        if task_name == "rtc_status":
+            if not ok:
+                self._append_debug(f"[error] rtc status failed: {error}")
+                return
+            status = result if isinstance(result, dict) else {}
+            sessions = status.get("sessions", {}) if isinstance(status, dict) else {}
+            if peer_name and isinstance(sessions, dict) and peer_name in sessions:
+                self._append_chat(peer_name, "sys", f"RTC status: {sessions[peer_name]}")
+            elif peer_name:
+                self._append_chat(peer_name, "sys", "RTC status: no active session")
+            return
+
+        if not ok:
+            self._append_debug(f"[error] {task_name} failed: {error}")
+            if task_name == "send_text" and peer_name:
+                self._append_chat(peer_name, "sys", f"Send failed: {error}")
 
     def _map_sender_to_peer(self, sender_id: str) -> str:
         if sender_id in self.peer_map:
@@ -504,28 +530,29 @@ class MessengerGui(QMainWindow):
                 return name
         return sender_id
 
-    def send_command(self, command: str) -> None:
-        if not self.is_running():
-            QMessageBox.information(self, "Not Running", "Start backend first.")
-            return
-
-        assert self.process is not None
-        self.process.write((command + "\n").encode("utf-8"))
-        self._append_debug(f"[gui] -> {command}")
-
     def require_peer(self) -> str:
         if not self.current_peer:
             QMessageBox.warning(self, "No Peer", "Select a peer from the list.")
             return ""
         return self.current_peer
 
-    def send_peer_command(self, prefix: str) -> None:
+    def _request_ping(self, purpose: str) -> None:
+        if not self.is_running():
+            QMessageBox.information(self, "Not Running", "Start backend first.")
+            return
+
         peer = self.require_peer()
         if not peer:
             return
-        self.send_command(f"{prefix} {peer}")
+
+        self._set_peer_status(peer, "checking")
+        self._run_backend_task("ping", self._must_backend().ping_peer, peer, context={"peer": peer, "purpose": purpose})
 
     def send_message(self) -> None:
+        if not self.is_running():
+            QMessageBox.information(self, "Not Running", "Start backend first.")
+            return
+
         peer = self.require_peer()
         if not peer:
             return
@@ -534,11 +561,15 @@ class MessengerGui(QMainWindow):
         if not text:
             return
 
-        self.send_command(f"/msg {peer} {text}")
         self._append_chat(peer, "out", text)
+        self._run_backend_task("send_text", self._must_backend().send_text, peer, text, context={"peer": peer})
         self.message_input.clear()
 
     def send_file(self) -> None:
+        if not self.is_running():
+            QMessageBox.information(self, "Not Running", "Start backend first.")
+            return
+
         peer = self.require_peer()
         if not peer:
             return
@@ -547,16 +578,47 @@ class MessengerGui(QMainWindow):
         if not path:
             return
 
-        self.send_command(f"/file {peer} {path}")
+        self._run_backend_task("send_file", self._must_backend().send_file, peer, path, context={"peer": peer})
         self._append_chat(peer, "out", f"Sent file: {Path(path).name}")
 
-    def send_rtc_status(self) -> None:
+    def send_rtc_connect(self) -> None:
+        if not self.is_running():
+            QMessageBox.information(self, "Not Running", "Start backend first.")
+            return
+
         peer = self.require_peer()
         if not peer:
             return
-        self.send_command(f"/rtc status {peer}")
+
+        self._run_backend_task("rtc_connect", self._must_backend().rtc_connect, peer, context={"peer": peer})
+
+    def send_rtc_accept(self) -> None:
+        if not self.is_running():
+            QMessageBox.information(self, "Not Running", "Start backend first.")
+            return
+
+        peer = self.require_peer()
+        if not peer:
+            return
+
+        self._run_backend_task("rtc_accept", self._must_backend().rtc_accept, peer, context={"peer": peer})
+
+    def send_rtc_status(self) -> None:
+        if not self.is_running():
+            QMessageBox.information(self, "Not Running", "Start backend first.")
+            return
+
+        peer = self.require_peer()
+        if not peer:
+            return
+
+        self._run_backend_task("rtc_status", self._must_backend().rtc_status, peer, context={"peer": peer})
 
     def send_rtc_test(self) -> None:
+        if not self.is_running():
+            QMessageBox.information(self, "Not Running", "Start backend first.")
+            return
+
         peer = self.require_peer()
         if not peer:
             return
@@ -566,15 +628,8 @@ class MessengerGui(QMainWindow):
             QMessageBox.warning(self, "Missing Data", "RTC test payload is required.")
             return
 
-        self.send_command(f"/rtc test {peer} {text}")
+        self._run_backend_task("rtc_test", self._must_backend().rtc_test, peer, text, context={"peer": peer})
         self.rtc_test_input.clear()
-
-    def send_raw(self) -> None:
-        raw = self.raw_input.text().strip()
-        if not raw:
-            return
-        self.send_command(raw)
-        self.raw_input.clear()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.stop_backend()

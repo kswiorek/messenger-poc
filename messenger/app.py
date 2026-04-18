@@ -7,7 +7,7 @@ import socket
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .protocol import build_message, read_json_line, send_json_line, utc_now_iso
 from .tor_transport import send_to_peer_expect_ack, socks5_connect_via_tor
@@ -23,13 +23,13 @@ except ImportError:
     RTCSessionDescription = Any  # type: ignore[assignment]
     AIORTC_AVAILABLE = False
 
-
-def print_prompt() -> None:
-    print("> ", end="", flush=True)
-
-
 class MessengerApp:
-    def __init__(self, cfg: dict):
+    def __init__(
+        self,
+        cfg: dict,
+        on_event: Callable[[str, dict], None] | None = None,
+        on_log: Callable[[str], None] | None = None,
+    ):
         self.cfg = cfg
         self.sender_id = cfg["sender_id"]
         self.listen_host = cfg["listen"]["host"]
@@ -51,6 +51,18 @@ class MessengerApp:
         self.rtc_loop = asyncio.new_event_loop()
         self.rtc_thread: threading.Thread | None = None
         self.rtc_configuration = self._build_rtc_configuration() if AIORTC_AVAILABLE else None
+        self.on_event = on_event
+        self.on_log = on_log
+
+    def _log(self, message: str) -> None:
+        if self.on_log is not None:
+            self.on_log(message)
+            return
+        print(message)
+
+    def _emit_event(self, event_type: str, payload: dict) -> None:
+        if self.on_event is not None:
+            self.on_event(event_type, payload)
 
     def _build_rtc_configuration(self) -> RTCConfiguration:
         ice_servers: list[RTCIceServer] = []
@@ -85,8 +97,15 @@ class MessengerApp:
 
         self.listener_thread = threading.Thread(target=self._listener_loop, daemon=True)
         self.listener_thread.start()
-        print(f"[listener] ready on {self.listen_host}:{self.listen_port} (sender_id={self.sender_id})")
-        print("[info] use /help for commands")
+        self._log(f"[listener] ready on {self.listen_host}:{self.listen_port} (sender_id={self.sender_id})")
+        self._emit_event(
+            "backend_started",
+            {
+                "listen_host": self.listen_host,
+                "listen_port": self.listen_port,
+                "sender_id": self.sender_id,
+            },
+        )
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -99,6 +118,7 @@ class MessengerApp:
             self.listener_thread.join(timeout=2.0)
 
         self._close_incoming_file_handles()
+        self._emit_event("backend_stopped", {})
 
     def _close_incoming_file_handles(self) -> None:
         with self.state_lock:
@@ -163,12 +183,11 @@ class MessengerApp:
                     msg_id=msg_id,
                 )
                 send_json_line(conn, pong)
-                print(f"\n[recv] ping from={addr} id={msg_id}")
-                print(f"[send] pong id={msg_id}")
-                print_prompt()
+                self._log(f"[recv] ping from={addr} id={msg_id}")
+                self._emit_event("ping_received", {"from": str(addr), "message_id": msg_id})
             elif msg_type == "text":
                 text = incoming.get("payload", {}).get("text", "")
-                print(f"\n[msg] {sender}: {text}")
+                self._emit_event("text_received", {"sender_id": sender, "text": text, "message_id": msg_id})
 
                 ack = build_message(
                     sender_id=self.sender_id,
@@ -176,7 +195,6 @@ class MessengerApp:
                     payload={"for_message_id": msg_id},
                 )
                 send_json_line(conn, ack)
-                print_prompt()
             elif msg_type == "signal_offer":
                 payload = incoming.get("payload", {})
                 self._handle_signal_offer(sender, payload)
@@ -186,7 +204,6 @@ class MessengerApp:
                     payload={"for_message_id": msg_id},
                 )
                 send_json_line(conn, ack)
-                print_prompt()
             elif msg_type == "signal_answer":
                 payload = incoming.get("payload", {})
                 self._handle_signal_answer(sender, payload)
@@ -196,7 +213,6 @@ class MessengerApp:
                     payload={"for_message_id": msg_id},
                 )
                 send_json_line(conn, ack)
-                print_prompt()
             else:
                 error = build_message(
                     sender_id=self.sender_id,
@@ -204,11 +220,9 @@ class MessengerApp:
                     payload={"reason": f"unsupported message type: {msg_type}"},
                 )
                 send_json_line(conn, error)
-                print(f"\n[warn] unsupported message type from {addr}: {msg_type}")
-                print_prompt()
+                self._log(f"[warn] unsupported message type from {addr}: {msg_type}")
         except Exception as exc:
-            print(f"\n[error] handling connection from {addr}: {exc}")
-            print_prompt()
+            self._log(f"[error] handling connection from {addr}: {exc}")
         finally:
             conn.close()
 
@@ -223,13 +237,13 @@ class MessengerApp:
     def _handle_signal_offer(self, sender_id: str, payload: dict) -> None:
         peer_name = self._peer_name_from_sender_id(sender_id)
         if not peer_name:
-            print(f"\n[warn] signal_offer from unknown sender_id={sender_id}. Add peer mapping in config.")
+            self._log(f"[warn] signal_offer from unknown sender_id={sender_id}. Add peer mapping in config.")
             return
 
         sdp = payload.get("sdp")
         sdp_type = payload.get("type")
         if not sdp or not sdp_type:
-            print(f"\n[warn] invalid signal_offer from {peer_name}")
+            self._log(f"[warn] invalid signal_offer from {peer_name}")
             return
 
         with self.state_lock:
@@ -239,7 +253,8 @@ class MessengerApp:
                 "received_at": utc_now_iso(),
             }
 
-        print(f"\n[rtc] received offer from {peer_name}. Run /rtc accept {peer_name}")
+        self._log(f"[rtc] received offer from {peer_name}. Run /rtc accept {peer_name}")
+        self._emit_event("rtc_offer_received", {"peer_name": peer_name})
 
     def _handle_signal_answer(self, sender_id: str, payload: dict) -> None:
         if not AIORTC_AVAILABLE:
@@ -247,20 +262,21 @@ class MessengerApp:
 
         peer_name = self._peer_name_from_sender_id(sender_id)
         if not peer_name:
-            print(f"\n[warn] signal_answer from unknown sender_id={sender_id}")
+            self._log(f"[warn] signal_answer from unknown sender_id={sender_id}")
             return
 
         sdp = payload.get("sdp")
         sdp_type = payload.get("type")
         if not sdp or not sdp_type:
-            print(f"\n[warn] invalid signal_answer from {peer_name}")
+            self._log(f"[warn] invalid signal_answer from {peer_name}")
             return
 
         try:
             self._run_coro_threadsafe(self._apply_answer(peer_name, sdp, sdp_type), timeout_sec=30.0)
-            print(f"\n[rtc] answer from {peer_name} applied")
+            self._log(f"[rtc] answer from {peer_name} applied")
+            self._emit_event("rtc_answer_applied", {"peer_name": peer_name})
         except Exception as exc:
-            print(f"\n[error] failed applying answer from {peer_name}: {exc}")
+            self._log(f"[error] failed applying answer from {peer_name}: {exc}")
 
     async def _wait_ice_gathering_complete(self, pc: RTCPeerConnection, timeout_sec: float = 10.0) -> None:
         start = time.time()
@@ -272,31 +288,29 @@ class MessengerApp:
     def _bind_data_channel(self, peer_name: str, channel: Any) -> None:
         @channel.on("open")
         def on_open() -> None:
-            print(f"\n[rtc] data channel open with {peer_name}")
-            print_prompt()
+            self._log(f"[rtc] data channel open with {peer_name}")
+            self._emit_event("rtc_data_open", {"peer_name": peer_name})
 
         @channel.on("close")
         def on_close() -> None:
-            print(f"\n[rtc] data channel closed with {peer_name}")
-            print_prompt()
+            self._log(f"[rtc] data channel closed with {peer_name}")
+            self._emit_event("rtc_data_closed", {"peer_name": peer_name})
 
         @channel.on("message")
         def on_message(message: Any) -> None:
             if isinstance(message, bytes):
-                print(f"\n[rtc] binary data from {peer_name}: {len(message)} bytes")
-                print_prompt()
+                self._log(f"[rtc] binary data from {peer_name}: {len(message)} bytes")
                 return
 
             try:
                 data = json.loads(message)
             except Exception:
-                print(f"\n[rtc] {peer_name}: {message}")
-                print_prompt()
+                self._log(f"[rtc] {peer_name}: {message}")
                 return
 
             msg_type = data.get("type")
             if msg_type == "rtc_test":
-                print(f"\n[rtc-test] {peer_name}: {data.get('text', '')}")
+                self._emit_event("rtc_test_received", {"peer_name": peer_name, "text": data.get("text", "")})
             elif msg_type == "file_meta":
                 self._on_file_meta(peer_name, data)
             elif msg_type == "file_chunk":
@@ -305,14 +319,18 @@ class MessengerApp:
                 self._on_file_done(peer_name, data, channel)
             elif msg_type == "file_ack":
                 transfer_id = data.get("transfer_id")
-                print(f"\n[file] transfer complete ack from {peer_name} transfer_id={transfer_id}")
+                self._log(f"[file] transfer complete ack from {peer_name} transfer_id={transfer_id}")
+                self._emit_event("file_ack", {"peer_name": peer_name, "transfer_id": transfer_id})
             elif msg_type == "file_error":
                 transfer_id = data.get("transfer_id")
                 reason = data.get("reason", "unknown")
-                print(f"\n[file] transfer error from {peer_name} transfer_id={transfer_id}: {reason}")
+                self._log(f"[file] transfer error from {peer_name} transfer_id={transfer_id}: {reason}")
+                self._emit_event(
+                    "file_error",
+                    {"peer_name": peer_name, "transfer_id": transfer_id, "reason": reason},
+                )
             else:
-                print(f"\n[rtc] message from {peer_name}: {data}")
-            print_prompt()
+                self._log(f"[rtc] message from {peer_name}: {data}")
 
     def _attach_peer_connection_handlers(self, peer_name: str, pc: RTCPeerConnection) -> None:
         @pc.on("connectionstatechange")
@@ -322,8 +340,8 @@ class MessengerApp:
                 session = self.rtc_sessions.get(peer_name)
                 if session:
                     session["connection_state"] = state
-            print(f"\n[rtc] {peer_name} connection state: {state}")
-            print_prompt()
+            self._log(f"[rtc] {peer_name} connection state: {state}")
+            self._emit_event("rtc_connection_state", {"peer_name": peer_name, "state": state})
 
         @pc.on("iceconnectionstatechange")
         def on_iceconnectionstatechange() -> None:
@@ -332,8 +350,8 @@ class MessengerApp:
                 session = self.rtc_sessions.get(peer_name)
                 if session:
                     session["ice_state"] = state
-            print(f"\n[rtc] {peer_name} ICE state: {state}")
-            print_prompt()
+            self._log(f"[rtc] {peer_name} ICE state: {state}")
+            self._emit_event("rtc_ice_state", {"peer_name": peer_name, "state": state})
 
         @pc.on("datachannel")
         def on_datachannel(channel: Any) -> None:
@@ -341,9 +359,9 @@ class MessengerApp:
                 session = self.rtc_sessions.get(peer_name)
                 if session:
                     session["channel"] = channel
-            print(f"\n[rtc] incoming data channel from {peer_name}: {channel.label}")
+            self._log(f"[rtc] incoming data channel from {peer_name}: {channel.label}")
             self._bind_data_channel(peer_name, channel)
-            print_prompt()
+            self._emit_event("rtc_data_channel", {"peer_name": peer_name, "label": channel.label})
 
     async def _create_offer(self, peer_name: str) -> dict:
         pc = RTCPeerConnection(configuration=self.rtc_configuration)
@@ -478,8 +496,16 @@ class MessengerApp:
                 if file_size > 0:
                     pct = (sent_bytes / file_size) * 100.0
                     if chunk_index == 1 or sent_bytes == file_size or chunk_index % 50 == 0:
-                        print(f"\n[file] sending to {peer_name}: {pct:.1f}% ({sent_bytes}/{file_size} bytes)")
-                        print_prompt()
+                        self._emit_event(
+                            "file_send_progress",
+                            {
+                                "peer_name": peer_name,
+                                "transfer_id": transfer_id,
+                                "sent_bytes": sent_bytes,
+                                "total_bytes": file_size,
+                                "percent": pct,
+                            },
+                        )
 
                 await asyncio.sleep(0)
 
@@ -488,8 +514,8 @@ class MessengerApp:
             "transfer_id": transfer_id,
         }
         channel.send(json.dumps(done))
-        print(f"\n[file] sent transfer_id={transfer_id} to {peer_name}")
-        print_prompt()
+        self._log(f"[file] sent transfer_id={transfer_id} to {peer_name}")
+        self._emit_event("file_sent", {"peer_name": peer_name, "transfer_id": transfer_id})
 
     def _on_file_meta(self, peer_name: str, data: dict) -> None:
         transfer_id = data.get("transfer_id")
@@ -498,7 +524,7 @@ class MessengerApp:
         sha256_hex = data.get("sha256")
 
         if not transfer_id or not file_name or not sha256_hex:
-            print(f"\n[file] invalid file_meta from {peer_name}")
+            self._log(f"[file] invalid file_meta from {peer_name}")
             return
 
         download_dir = Path(self.webrtc_cfg.get("download_dir", "downloads"))
@@ -530,25 +556,35 @@ class MessengerApp:
         with self.state_lock:
             self.incoming_files[transfer_id] = state
 
-        print(f"\n[file] receiving from {peer_name}: {safe_name} ({file_size} bytes) transfer_id={transfer_id}")
+        self._log(f"[file] receiving from {peer_name}: {safe_name} ({file_size} bytes) transfer_id={transfer_id}")
+        self._emit_event(
+            "file_receive_started",
+            {
+                "peer_name": peer_name,
+                "transfer_id": transfer_id,
+                "name": safe_name,
+                "size": file_size,
+                "path": str(target_path),
+            },
+        )
 
     def _on_file_chunk(self, peer_name: str, data: dict) -> None:
         transfer_id = data.get("transfer_id")
         b64_data = data.get("data")
         if not transfer_id or b64_data is None:
-            print(f"\n[file] invalid file_chunk from {peer_name}")
+            self._log(f"[file] invalid file_chunk from {peer_name}")
             return
 
         with self.state_lock:
             state = self.incoming_files.get(transfer_id)
         if not state:
-            print(f"\n[file] unknown transfer_id from {peer_name}: {transfer_id}")
+            self._log(f"[file] unknown transfer_id from {peer_name}: {transfer_id}")
             return
 
         try:
             chunk = base64.b64decode(b64_data)
         except Exception:
-            print(f"\n[file] invalid base64 chunk from {peer_name}")
+            self._log(f"[file] invalid base64 chunk from {peer_name}")
             return
 
         handle = state["handle"]
@@ -560,7 +596,16 @@ class MessengerApp:
         recv = state["received"]
         if total > 0 and (recv == total or recv % (1024 * 1024) < len(chunk)):
             pct = (recv / total) * 100.0
-            print(f"\n[file] receiving from {peer_name}: {pct:.1f}% ({recv}/{total} bytes)")
+            self._emit_event(
+                "file_receive_progress",
+                {
+                    "peer_name": peer_name,
+                    "transfer_id": transfer_id,
+                    "received_bytes": recv,
+                    "total_bytes": total,
+                    "percent": pct,
+                },
+            )
 
     def _send_file_result(self, channel: Any, transfer_id: str, success: bool, reason: str = "") -> None:
         payload = {"transfer_id": transfer_id}
@@ -574,13 +619,13 @@ class MessengerApp:
     def _on_file_done(self, peer_name: str, data: dict, channel: Any) -> None:
         transfer_id = data.get("transfer_id")
         if not transfer_id:
-            print(f"\n[file] invalid file_done from {peer_name}")
+            self._log(f"[file] invalid file_done from {peer_name}")
             return
 
         with self.state_lock:
             state = self.incoming_files.pop(transfer_id, None)
         if not state:
-            print(f"\n[file] unknown transfer_id on done from {peer_name}: {transfer_id}")
+            self._log(f"[file] unknown transfer_id on done from {peer_name}: {transfer_id}")
             return
 
         handle = state["handle"]
@@ -593,18 +638,22 @@ class MessengerApp:
 
         if received_size != expected_size:
             reason = f"size mismatch expected={expected_size} received={received_size}"
-            print(f"\n[file] transfer failed from {peer_name}: {reason}")
+            self._log(f"[file] transfer failed from {peer_name}: {reason}")
             self._send_file_result(channel, transfer_id, success=False, reason=reason)
             return
 
         if actual_hash != expected_hash:
             reason = "sha256 mismatch"
-            print(f"\n[file] transfer failed from {peer_name}: {reason}")
+            self._log(f"[file] transfer failed from {peer_name}: {reason}")
             self._send_file_result(channel, transfer_id, success=False, reason=reason)
             return
 
         file_path = state["path"]
-        print(f"\n[file] saved from {peer_name}: {file_path}")
+        self._log(f"[file] saved from {peer_name}: {file_path}")
+        self._emit_event(
+            "file_received",
+            {"peer_name": peer_name, "transfer_id": transfer_id, "path": str(file_path)},
+        )
         self._send_file_result(channel, transfer_id, success=True)
 
     def _resolve_peer(self, peer_name: str) -> tuple[str, int]:
@@ -619,32 +668,38 @@ class MessengerApp:
 
         return target_onion, target_port
 
-    def ping_peer(self, peer_name: str) -> None:
-        target_onion, target_port = self._resolve_peer(peer_name)
-        conn = socks5_connect_via_tor(
-            socks_host=self.socks_host,
-            socks_port=self.socks_port,
-            dest_host=target_onion,
-            dest_port=target_port,
-        )
+    def ping_peer(self, peer_name: str) -> float:
         try:
-            nonce = secrets.token_hex(8)
-            ping = build_message(sender_id=self.sender_id, msg_type="ping", payload={"nonce": nonce})
-            t0 = time.time()
-            send_json_line(conn, ping)
+            target_onion, target_port = self._resolve_peer(peer_name)
+            conn = socks5_connect_via_tor(
+                socks_host=self.socks_host,
+                socks_port=self.socks_port,
+                dest_host=target_onion,
+                dest_port=target_port,
+            )
+            try:
+                nonce = secrets.token_hex(8)
+                ping = build_message(sender_id=self.sender_id, msg_type="ping", payload={"nonce": nonce})
+                t0 = time.time()
+                send_json_line(conn, ping)
 
-            response = read_json_line(conn)
-            elapsed_ms = (time.time() - t0) * 1000.0
-            if response.get("type") != "pong":
-                raise RuntimeError(f"expected pong, got {response.get('type')}")
+                response = read_json_line(conn)
+                elapsed_ms = (time.time() - t0) * 1000.0
+                if response.get("type") != "pong":
+                    raise RuntimeError(f"expected pong, got {response.get('type')}")
 
-            echoed = response.get("payload", {}).get("echo")
-            if echoed != nonce:
-                raise RuntimeError("pong echo nonce did not match ping nonce")
+                echoed = response.get("payload", {}).get("echo")
+                if echoed != nonce:
+                    raise RuntimeError("pong echo nonce did not match ping nonce")
 
-            print(f"[ok] ping {peer_name} rtt_ms={elapsed_ms:.1f}")
-        finally:
-            conn.close()
+                self._log(f"[ok] ping {peer_name} rtt_ms={elapsed_ms:.1f}")
+                self._emit_event("ping_result", {"peer_name": peer_name, "ok": True, "rtt_ms": elapsed_ms})
+                return elapsed_ms
+            finally:
+                conn.close()
+        except Exception as exc:
+            self._emit_event("ping_result", {"peer_name": peer_name, "ok": False, "error": str(exc)})
+            raise
 
     def send_text(self, peer_name: str, text: str) -> None:
         target_onion, target_port = self._resolve_peer(peer_name)
@@ -657,7 +712,8 @@ class MessengerApp:
             msg_type="text",
             payload={"text": text},
         )
-        print(f"[sent] to={peer_name}")
+        self._log(f"[sent] to={peer_name}")
+        self._emit_event("text_sent", {"peer_name": peer_name, "text": text})
 
     def rtc_connect(self, peer_name: str) -> None:
         if not AIORTC_AVAILABLE:
@@ -677,7 +733,8 @@ class MessengerApp:
             msg_type="signal_offer",
             payload=offer_payload,
         )
-        print(f"[rtc] offer sent to {peer_name}. Waiting for answer...")
+        self._log(f"[rtc] offer sent to {peer_name}. Waiting for answer...")
+        self._emit_event("rtc_offer_sent", {"peer_name": peer_name})
 
     def rtc_accept(self, peer_name: str) -> None:
         if not AIORTC_AVAILABLE:
@@ -702,42 +759,58 @@ class MessengerApp:
             msg_type="signal_answer",
             payload=answer_payload,
         )
-        print(f"[rtc] answer sent to {peer_name}")
+        self._log(f"[rtc] answer sent to {peer_name}")
+        self._emit_event("rtc_answer_sent", {"peer_name": peer_name})
 
-    def rtc_status(self, peer_name: str | None = None) -> None:
+    def rtc_status(self, peer_name: str | None = None) -> dict:
         with self.state_lock:
             pending = dict(self.pending_offers)
             sessions = dict(self.rtc_sessions)
 
-        if pending:
-            print("[rtc] pending offers:")
-            for pending_peer in pending.keys():
-                if peer_name and pending_peer != peer_name:
-                    continue
-                print(f"- {pending_peer}")
-        else:
-            print("[rtc] no pending offers")
+        pending_peers: list[str] = []
+        for pending_peer in pending.keys():
+            if peer_name and pending_peer != peer_name:
+                continue
+            pending_peers.append(pending_peer)
 
-        if not sessions:
-            print("[rtc] no active sessions")
-            return
-
+        status_sessions: dict[str, dict] = {}
         for session_peer, session in sessions.items():
             if peer_name and session_peer != peer_name:
                 continue
             channel = session.get("channel")
             channel_state = channel.readyState if channel else "none"
-            print(
-                f"- {session_peer}: role={session.get('role')} conn={session.get('connection_state')} "
-                f"ice={session.get('ice_state')} data={channel_state}"
-            )
+            status_sessions[session_peer] = {
+                "role": session.get("role"),
+                "connection_state": session.get("connection_state"),
+                "ice_state": session.get("ice_state"),
+                "data_channel_state": channel_state,
+            }
+
+        if pending_peers:
+            self._log("[rtc] pending offers:")
+            for pending_peer in pending_peers:
+                self._log(f"- {pending_peer}")
+        else:
+            self._log("[rtc] no pending offers")
+
+        if not status_sessions:
+            self._log("[rtc] no active sessions")
+        else:
+            for session_peer, session_data in status_sessions.items():
+                self._log(
+                    f"- {session_peer}: role={session_data['role']} conn={session_data['connection_state']} "
+                    f"ice={session_data['ice_state']} data={session_data['data_channel_state']}"
+                )
+
+        return {"pending_offers": pending_peers, "sessions": status_sessions}
 
     def rtc_test(self, peer_name: str, text: str) -> None:
         if not AIORTC_AVAILABLE:
             raise RuntimeError("WebRTC support requires aiortc. Install with: pip install aiortc")
 
         self._run_coro_threadsafe(self._send_rtc_test_message(peer_name, text), timeout_sec=10.0)
-        print(f"[rtc-test] sent to {peer_name}")
+        self._log(f"[rtc-test] sent to {peer_name}")
+        self._emit_event("rtc_test_sent", {"peer_name": peer_name, "text": text})
 
     def send_file(self, peer_name: str, path_text: str) -> None:
         if not AIORTC_AVAILABLE:
