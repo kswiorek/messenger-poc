@@ -1,9 +1,10 @@
 import html
 import re
 import sys
+import time
 from pathlib import Path
 
-from PyQt6.QtCore import QProcess
+from PyQt6.QtCore import QProcess, QTimer
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -27,8 +28,8 @@ from messenger.config import load_config
 BASE_CONFIG_PATH = Path("messenger_config.json")
 LOCAL_CONFIG_PATH = Path("messenger_config.local.json")
 
-
 MSG_IN_PATTERN = re.compile(r"\[msg\]\s+([^:]+):\s*(.*)")
+PING_OK_PATTERN = re.compile(r"\[ok\]\s+ping\s+(\S+)\s+rtt_ms=([0-9.]+)")
 
 
 class MessengerGui(QMainWindow):
@@ -45,6 +46,20 @@ class MessengerGui(QMainWindow):
         self.peer_map = self._load_peers_from_config()
         self.current_peer = ""
         self.chat_history: dict[str, list[tuple[str, str]]] = {name: [] for name in self.peer_map.keys()}
+        self.peer_status: dict[str, str] = {name: "unknown" for name in self.peer_map.keys()}
+        self.peer_rtt_ms: dict[str, str] = {}
+
+        self.ping_queue: list[str] = []
+        self.active_ping_peer = ""
+        self.active_ping_started_ms = 0
+
+        self.probe_interval_timer = QTimer(self)
+        self.probe_interval_timer.setInterval(30000)
+        self.probe_interval_timer.timeout.connect(self._enqueue_full_probe)
+
+        self.ping_worker_timer = QTimer(self)
+        self.ping_worker_timer.setInterval(200)
+        self.ping_worker_timer.timeout.connect(self._process_ping_queue)
 
         self._build_ui()
         self._wire_events()
@@ -68,7 +83,6 @@ class MessengerGui(QMainWindow):
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(10)
 
-        # Left sidebar (peer list)
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -81,14 +95,15 @@ class MessengerGui(QMainWindow):
         self.search_input.setPlaceholderText("Search peers")
 
         self.refresh_peers_button = QPushButton("Refresh Peers")
+        self.probe_now_button = QPushButton("Probe Availability")
         self.peer_list = QListWidget()
 
         left_layout.addWidget(left_title)
         left_layout.addWidget(self.search_input)
         left_layout.addWidget(self.refresh_peers_button)
+        left_layout.addWidget(self.probe_now_button)
         left_layout.addWidget(self.peer_list, stretch=1)
 
-        # Right panel (conversation)
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -153,6 +168,7 @@ class MessengerGui(QMainWindow):
         self.raw_input = QLineEdit()
         self.raw_input.setPlaceholderText("Advanced raw command, e.g. /rtc status peer2")
         self.send_raw_button = QPushButton("Send Raw")
+
         raw_row = QWidget()
         raw_row_layout = QHBoxLayout(raw_row)
         raw_row_layout.setContentsMargins(0, 0, 0, 0)
@@ -218,25 +234,93 @@ class MessengerGui(QMainWindow):
         self.peer_list.currentItemChanged.connect(self._on_peer_selected)
         self.search_input.textChanged.connect(self._filter_peers)
         self.refresh_peers_button.clicked.connect(self._refresh_peers)
+        self.probe_now_button.clicked.connect(self._enqueue_full_probe)
 
     def _populate_peer_list(self) -> None:
+        previous_peer = self.current_peer
         self.peer_list.clear()
+
+        status_label = {
+            "online": "[online]",
+            "checking": "[checking]",
+            "offline": "[offline]",
+            "unknown": "[unknown]",
+        }
+
         for peer_name, peer_cfg in self.peer_map.items():
             onion = str(peer_cfg.get("onion", ""))
             subtitle = onion if len(onion) < 40 else onion[:40] + "..."
-            item = QListWidgetItem(f"{peer_name}\n{subtitle}")
+            status = self.peer_status.get(peer_name, "unknown")
+            rtt = self.peer_rtt_ms.get(peer_name, "")
+            second = (status_label.get(status, "[unknown]") + (f" {rtt}" if rtt else "")).strip()
+            item = QListWidgetItem(f"{peer_name} {second}\n{subtitle}")
             item.setData(256, peer_name)
             self.peer_list.addItem(item)
 
         if self.peer_list.count() > 0:
-            self.peer_list.setCurrentRow(0)
+            row_to_select = 0
+            if previous_peer:
+                for row in range(self.peer_list.count()):
+                    item = self.peer_list.item(row)
+                    if item is not None and str(item.data(256) or "") == previous_peer:
+                        row_to_select = row
+                        break
+            self.peer_list.setCurrentRow(row_to_select)
 
     def _refresh_peers(self) -> None:
         self.peer_map = self._load_peers_from_config()
         for name in self.peer_map.keys():
             self.chat_history.setdefault(name, [])
+            self.peer_status.setdefault(name, "unknown")
         self._populate_peer_list()
         self._append_debug("[gui] peer list reloaded from config")
+        self._enqueue_full_probe()
+
+    def _set_peer_status(self, peer_name: str, status: str, rtt_ms: str = "") -> None:
+        if peer_name not in self.peer_map:
+            return
+        self.peer_status[peer_name] = status
+        if rtt_ms:
+            self.peer_rtt_ms[peer_name] = rtt_ms
+        elif status != "online":
+            self.peer_rtt_ms.pop(peer_name, None)
+        self._populate_peer_list()
+
+    def _enqueue_full_probe(self) -> None:
+        if not self.is_running():
+            return
+        for peer_name in self.peer_map.keys():
+            if self.peer_status.get(peer_name) != "online":
+                self._set_peer_status(peer_name, "checking")
+            if peer_name != self.active_ping_peer and peer_name not in self.ping_queue:
+                self.ping_queue.append(peer_name)
+        if self.ping_queue and not self.ping_worker_timer.isActive():
+            self.ping_worker_timer.start()
+
+    def _process_ping_queue(self) -> None:
+        if not self.is_running():
+            self.ping_worker_timer.stop()
+            self.ping_queue.clear()
+            self.active_ping_peer = ""
+            return
+
+        now_ms = int(time.time() * 1000)
+        if self.active_ping_peer:
+            if now_ms - self.active_ping_started_ms > 12000:
+                timed_out_peer = self.active_ping_peer
+                self.active_ping_peer = ""
+                self._set_peer_status(timed_out_peer, "offline")
+                self._append_debug(f"[presence] ping timeout for {timed_out_peer}")
+            return
+
+        if not self.ping_queue:
+            self.ping_worker_timer.stop()
+            return
+
+        peer_name = self.ping_queue.pop(0)
+        self.active_ping_peer = peer_name
+        self.active_ping_started_ms = now_ms
+        self.send_command(f"/ping {peer_name}")
 
     def _filter_peers(self, text: str) -> None:
         text_lower = text.strip().lower()
@@ -323,6 +407,9 @@ class MessengerGui(QMainWindow):
         self.stop_button.setEnabled(True)
         self._append_debug("[gui] backend started")
 
+        self._enqueue_full_probe()
+        self.probe_interval_timer.start()
+
     def stop_backend(self) -> None:
         if not self.is_running():
             return
@@ -334,14 +421,42 @@ class MessengerGui(QMainWindow):
             if not self.process.waitForFinished(2000):
                 self.process.kill()
 
+        self.probe_interval_timer.stop()
+        self.ping_worker_timer.stop()
+        self.ping_queue.clear()
+        self.active_ping_peer = ""
+
     def _on_process_finished(self) -> None:
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+
+        self.probe_interval_timer.stop()
+        self.ping_worker_timer.stop()
+        self.ping_queue.clear()
+        self.active_ping_peer = ""
+
         self._append_debug("[gui] backend stopped")
 
     def _handle_backend_line(self, line: str) -> None:
         stripped = line.strip()
         if not stripped:
+            return
+
+        ping_match = PING_OK_PATTERN.match(stripped)
+        if ping_match:
+            peer_name = ping_match.group(1).strip()
+            rtt = ping_match.group(2).strip()
+            self._set_peer_status(peer_name, "online", rtt_ms=f"{rtt} ms")
+            if self.active_ping_peer == peer_name:
+                self.active_ping_peer = ""
+            self._append_debug(stripped)
+            return
+
+        if stripped.startswith("[error]") and self.active_ping_peer:
+            failed_peer = self.active_ping_peer
+            self.active_ping_peer = ""
+            self._set_peer_status(failed_peer, "offline")
+            self._append_debug(stripped)
             return
 
         msg_match = MSG_IN_PATTERN.match(stripped)
@@ -350,6 +465,7 @@ class MessengerGui(QMainWindow):
             text = msg_match.group(2).strip()
             peer_name = self._map_sender_to_peer(sender_id)
             self._append_chat(peer_name, "in", text)
+            self._set_peer_status(peer_name, "online")
             return
 
         if stripped.startswith("[file]") or stripped.startswith("[rtc]") or stripped.startswith("[rtc-test]"):
@@ -363,6 +479,7 @@ class MessengerGui(QMainWindow):
     def _read_stdout(self) -> None:
         if self.process is None:
             return
+
         chunk = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
         self.stdout_buffer += chunk.replace("\r", "")
 
@@ -374,6 +491,7 @@ class MessengerGui(QMainWindow):
     def _read_stderr(self) -> None:
         if self.process is None:
             return
+
         chunk = bytes(self.process.readAllStandardError()).decode("utf-8", errors="replace")
         for line in chunk.splitlines():
             self._append_debug(f"[stderr] {line}")
@@ -442,10 +560,12 @@ class MessengerGui(QMainWindow):
         peer = self.require_peer()
         if not peer:
             return
+
         text = self.rtc_test_input.text().strip()
         if not text:
             QMessageBox.warning(self, "Missing Data", "RTC test payload is required.")
             return
+
         self.send_command(f"/rtc test {peer} {text}")
         self.rtc_test_input.clear()
 
